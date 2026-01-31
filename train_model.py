@@ -19,10 +19,11 @@ logger = logging.getLogger("train_model")
 
 
 def collate(items):
-    words = pad_sequence([x for x, _, _ in items], batch_first=True)
-    stresses = pad_sequence([x for _, x, _ in items], batch_first=True)
-    lengths = torch.tensor([x for _, _, x in items])
-    return (words, stresses, lengths)
+    words = pad_sequence([x for x, _, _, _ in items], batch_first=True)
+    stresses = pad_sequence([x for _, x, _, _ in items], batch_first=True)
+    lengths = torch.tensor([x for _, _, x, _ in items])
+    fnames = [x for _, _, _, x in items]
+    return (words, stresses, lengths, fnames)
 
 
 class Model(Module):
@@ -93,7 +94,8 @@ if __name__ == "__main__":
                         (
                             torch.tensor([word_vocab.setdefault(w, len(word_vocab)) for w in words]),
                             torch.tensor([stress_vocab.setdefault(s, len(stress_vocab)) for s in stresses]),
-                            len(words)
+                            len(words),
+                            fname
                         )
                     )
 
@@ -132,7 +134,7 @@ if __name__ == "__main__":
         dev_guesses = []
         dev_golds = []
         model.train()
-        for words, stresses, lengths in train_dl:
+        for words, stresses, lengths, fnames in train_dl:
             out = model(words)
             ces = cross_entropy(torch.transpose(out, 1, 2), stresses, reduction="none")
             uces = unpad_sequence(ces, lengths, batch_first=True)
@@ -144,7 +146,7 @@ if __name__ == "__main__":
             train_losses.append(loss.detach().item())
         train_loss = sum(train_losses) / (len(train_losses) * args.batch_size)
         model.eval()
-        for words, stresses, lengths in dev_dl:
+        for words, stresses, lengths, fnames in dev_dl:
             out = model(words)
             dev_guesses.append(torch.cat(unpad_sequence(out.argmax(dim=2).detach(), lengths, batch_first=True)))
             dev_golds.append(torch.cat(unpad_sequence(stresses.detach(), lengths, batch_first=True)))            
@@ -172,18 +174,36 @@ if __name__ == "__main__":
     model.eval()
     test_losses = []
     test_guesses = []
-    test_golds = []    
-    for words, stresses, lengths in test_dl:
+    test_golds = []
+    test_fnames = []
+    
+    for words, stresses, lengths, fnames in test_dl:
         out = model(words)
+        test_fnames.append(sum([[f] * l for l, f in zip(lengths, fnames)], []))
         test_guesses.append(torch.cat(unpad_sequence(out.argmax(dim=2).detach(), lengths, batch_first=True)))
         test_golds.append(torch.cat(unpad_sequence(stresses.detach(), lengths, batch_first=True)))            
         kls = cross_entropy(torch.transpose(out, 1, 2), stresses, reduction="none")
         loss = sum([x.sum() for x in torch.nn.utils.rnn.unpad_sequence(kls, lengths, batch_first=True)])
         test_losses.append(loss.detach().item())
+        
+    test_fnames = sum(test_fnames, [])
     test_guesses = torch.cat(test_guesses)
     test_golds = torch.cat(test_golds)
     test_acc = (test_guesses == test_golds).sum() / test_guesses.shape[0]        
     logger.info("Final average instance loss (test): %f\n  Test accuracy: %f", sum(test_losses) / (len(test_losses) * args.batch_size), test_acc)
+
+    indices = {}
+    for i, fname in enumerate(test_fnames):
+        indices[fname] = indices.get(fname, [])
+        indices[fname].append(i)
+
+    fname_accs = {}
+    for fname, idxs in indices.items():
+        fname_accs[fname] = (test_guesses[idxs] == test_golds[idxs]).sum() / len(idxs)
+
+    logger.info("Accuracy by section:")
+    for fname, acc in reversed(sorted(fname_accs.items(), key=lambda x : x[1])):
+        print("{:.3f} : {}".format(acc, os.path.basename(fname).replace("_gui_complete.csv", "")))
     
     with open(args.output, "wb") as ofd:
         torch.save(model, ofd)
